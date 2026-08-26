@@ -1,0 +1,124 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "AFTER API",
+    "version": "1.0.0",
+    "description": "AFTER is an AI-powered financial decision companion that helps everyday people make better financial decisions."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000",
+      "description": "Local development server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Authentication",
+      "description": "User authentication and device management"
+    },
+    {
+      "name": "Agent",
+      "description": "AFTER AI financial decision agent"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "description": "",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "description": "",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/auth/device": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Authenticate device",
+        "description": "Creates or retrieves an AFTER user using a device UUID.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "deviceId": {
+                    "example": "any"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agent/chat": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Chat with AFTER",
+        "description": "Send a natural-language financial question to AFTER. The device ID allows AFTER to remember the user",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "deviceId",
+                  "message"
+                ],
+                "properties": {
+                  "deviceId": {
+                    "type": "string",
+                    "example": "test-device-001"
+                  },
+                  "message": {
+                    "type": "string",
+                    "example": "I make ₦1,200,000 a month and spend ₦700,000. Can I afford an ₦8,000,000 car?"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
