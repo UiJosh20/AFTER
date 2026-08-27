@@ -114,7 +114,6 @@ export function registerAgentSocket(io: Server) {
         for await (const chunk of generateAgentResponse({
           message,
           analysis,
-          isFinancialIntent: isFinancial,
           history,
         })) {
           completeResponse += chunk;
