@@ -1,140 +1,165 @@
+/**
+ * agent.socket.ts
+ *
+ * On top of the previous version (acks, reconnect resync, single room join):
+ * the response stream is now run through splitIntoParts (message-splitter.ts)
+ * so a multi-thought response arrives as several short "agent:response:chunk"
+ * / "agent:response:part-complete" bubbles instead of one long one. A small
+ * pacing delay between bubbles makes it read like someone typing separate
+ * texts rather than everything appearing at once.
+ */
+
 import { Server, Socket } from "socket.io";
 import {
   getOrCreateUser,
-  getOrCreateFinancialProfile,
   getOrCreateConversation,
-  saveMessage,
   getConversationMessages,
 } from "../services/memory/memory.service.js";
-import { extractFinancialDecision } from "../services/ai/agent.service.js";
-import { analyzeFinancialDecision } from "../services/financial/financial-engine.service.js";
-import { generateAgentResponse } from "../services/ai/response.service.js";
+
+import { splitIntoParts } from "../services/ai/message-splitter.js";
+import { persistAssistantMessage, runAgentPipeline } from "../services/ai/agent-pipline.service.js";
 
 interface AgentMessagePayload {
   deviceId: string;
   message: string;
 }
 
-// Quick keyword & numeric regex to detect financial queries instantly
-function hasFinancialIntent(message: string): boolean {
-  const financialKeywords = [
-    "buy", "cost", "afford", "naira", "dollar", "price", "spend", "salary",
-    "earn", "income", "expenses", "save", "savings", "debt", "invest", "budget",
-    "loan", "car", "house", "rent", "pay"
-  ];
-  const containsNumber = /\d+/.test(message);
-  const lowerMsg = message.toLowerCase();
+interface AgentMessageAck {
+  received: boolean;
+  error?: string;
+}
 
-  return (
-    containsNumber ||
-    financialKeywords.some((word) => lowerMsg.includes(word))
-  );
+interface AgentSyncPayload {
+  deviceId: string;
+  since?: number;
+}
+
+// Brief pause between bubbles so multi-part responses read like separate
+// texts rather than one instant dump. Tune or remove for demo pacing.
+const INTER_BUBBLE_DELAY_MS = 350;
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function registerAgentSocket(io: Server) {
   io.on("connection", (socket: Socket) => {
     console.log(`[Socket.IO]: Client connected ${socket.id}`);
 
-    socket.on("join:device", (deviceId: string) => {
-      if (deviceId) {
-        socket.join(deviceId);
+    let joinedDevice: string | null = null;
+
+    socket.on("join:device", (deviceId: string, ack?: (ok: boolean) => void) => {
+      if (!deviceId) {
+        ack?.(false);
+        return;
       }
+      if (joinedDevice !== deviceId) {
+        socket.join(deviceId);
+        joinedDevice = deviceId;
+      }
+      ack?.(true);
     });
 
-    socket.on("agent:message", async (payload: AgentMessagePayload) => {
-      try {
-        if (!payload?.deviceId || !payload?.message?.trim()) {
-          socket.emit("agent:error", { message: "Device ID and message are required." });
-          return;
-        }
-
-        const { deviceId, message } = payload;
-        socket.join(deviceId);
-
-        const emitToDevice = (event: string, data: any) => {
-          io.to(deviceId).emit(event, data);
-        };
-
-        const user = await getOrCreateUser(deviceId);
-        const profile = await getOrCreateFinancialProfile(user._id);
-        const conversation = await getOrCreateConversation(user._id);
-
-        await saveMessage(user._id, conversation._id, "user", message);
-        emitToDevice("agent:thinking", { conversationId: conversation._id });
-
-        const history = await getConversationMessages(conversation._id);
-
-        // Check if message is casual chat or financial query
-        const isFinancial = hasFinancialIntent(message);
-        let decision: any = null;
-        let analysis: any = null;
-
-        if (isFinancial) {
-          console.log("[Agent Socket]: Financial intent detected. Extracting decision...");
-          decision = await extractFinancialDecision(message);
-
-          let profileUpdated = false;
-          if (decision.monthlyIncome !== undefined) { profile.monthlyIncome = decision.monthlyIncome; profileUpdated = true; }
-          if (decision.monthlyExpenses !== undefined) { profile.monthlyExpenses = decision.monthlyExpenses; profileUpdated = true; }
-          if (decision.savings !== undefined) { profile.savings = decision.savings; profileUpdated = true; }
-          if (decision.investments !== undefined) { profile.investments = decision.investments; profileUpdated = true; }
-          if (decision.totalDebt !== undefined) { profile.totalDebt = decision.totalDebt; profileUpdated = true; }
-          if (decision.monthlyDebtPayments !== undefined) { profile.monthlyDebtPayments = decision.monthlyDebtPayments; profileUpdated = true; }
-
-          if (profileUpdated) {
-            await profile.save();
+    socket.on(
+      "agent:sync",
+      async (payload: AgentSyncPayload, ack?: (data: { messages: any[] }) => void) => {
+        try {
+          if (!payload?.deviceId) {
+            ack?.({ messages: [] });
+            return;
           }
 
-          if (decision.purchaseAmount !== undefined) {
-            analysis = analyzeFinancialDecision(
-              {
-                monthlyIncome: profile.monthlyIncome,
-                monthlyExpenses: profile.monthlyExpenses,
-                savings: profile.savings,
-                investments: profile.investments,
-                totalDebt: profile.totalDebt,
-                monthlyDebtPayments: profile.monthlyDebtPayments,
-              },
-              {
-                amount: decision.purchaseAmount,
-                category: decision.category ?? "purchase",
-              }
-            );
+          const user = await getOrCreateUser(payload.deviceId);
+          const conversation = await getOrCreateConversation(user._id);
+          const allMessages = await getConversationMessages(conversation._id);
 
-            emitToDevice("agent:analysis", { analysis });
-          }
+          const since = payload.since ?? 0;
+          const missed = allMessages.filter((m: any) => {
+            const createdAt = m.createdAt ? new Date(m.createdAt).getTime() : 0;
+            return m.role === "assistant" && createdAt > since;
+          });
 
-          emitToDevice("agent:decision", { decision });
-        } else {
-          console.log("[Agent Socket]: Casual intent detected. Skipping financial engine.");
+          ack?.({ messages: missed });
+        } catch (error) {
+          console.error("[Agent Socket]: Sync error:", error);
+          ack?.({ messages: [] });
         }
-
-        // Stream AI response immediately
-        let completeResponse = "";
-        for await (const chunk of generateAgentResponse({
-          message,
-          analysis,
-          history,
-        })) {
-          completeResponse += chunk;
-          emitToDevice("agent:response:chunk", { content: chunk });
-        }
-
-        await saveMessage(user._id, conversation._id, "assistant", completeResponse);
-
-        emitToDevice("agent:response:complete", {
-          conversationId: conversation._id,
-          content: completeResponse,
-        });
-
-        emitToDevice("agent:complete", { conversationId: conversation._id });
-      } catch (error) {
-        console.error("[Agent Socket]: Error:", error);
-        io.to(payload.deviceId).emit("agent:error", {
-          message: "Something went wrong while processing your request.",
-        });
       }
-    });
+    );
+
+    socket.on(
+      "agent:message",
+      async (payload: AgentMessagePayload, ack?: (res: AgentMessageAck) => void) => {
+        try {
+          if (!payload?.deviceId || !payload?.message?.trim()) {
+            ack?.({ received: false, error: "Device ID and message are required." });
+            socket.emit("agent:error", { message: "Device ID and message are required." });
+            return;
+          }
+
+          const { deviceId, message } = payload;
+
+          if (joinedDevice !== deviceId) {
+            socket.join(deviceId);
+            joinedDevice = deviceId;
+          }
+
+          ack?.({ received: true });
+
+          const emitToDevice = (event: string, data: any) => {
+            io.to(deviceId).emit(event, data);
+          };
+
+          emitToDevice("agent:thinking", {});
+
+          const { decision, analysis, missingFields, responseStream, conversationId, userId } =
+            await runAgentPipeline(deviceId, message);
+
+          if (decision) {
+            emitToDevice("agent:decision", { decision });
+          }
+          if (analysis) {
+            emitToDevice("agent:analysis", { analysis, missingFields });
+          } else if (missingFields.length > 0) {
+            emitToDevice("agent:missing-fields", { missingFields });
+          }
+
+          const parts: string[] = [];
+
+          for await (const event of splitIntoParts(responseStream)) {
+            if (event.type === "chunk") {
+              emitToDevice("agent:response:chunk", { content: event.content });
+            } else {
+              // A bubble is finished — tell the client to seal it, then
+              // pause briefly before the next one starts streaming in.
+              parts.push(event.content);
+              emitToDevice("agent:response:part-complete", {});
+              await delay(INTER_BUBBLE_DELAY_MS);
+            }
+          }
+
+          const completeResponse = parts.join("\n\n");
+
+          await persistAssistantMessage(userId, conversationId, completeResponse);
+
+          emitToDevice("agent:response:complete", {
+            conversationId,
+            content: completeResponse,
+          });
+
+          emitToDevice("agent:complete", { conversationId });
+        } catch (error) {
+          console.error("[Agent Socket]: Error:", error);
+          const deviceId = payload?.deviceId;
+          if (deviceId) {
+            io.to(deviceId).emit("agent:error", {
+              message: "Something went wrong while processing your request.",
+            });
+          }
+          ack?.({ received: false, error: "Internal error while processing message." });
+        }
+      }
+    );
 
     socket.on("disconnect", (reason) => {
       console.log(`[Socket.IO]: Client disconnected ${socket.id} (${reason})`);

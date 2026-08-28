@@ -1,3 +1,19 @@
+/**
+ * socket-test/page.tsx
+ *
+ * New in this version:
+ *  1. Handles "agent:response:part-complete" — seals the current bubble so
+ *     the next chunk starts a fresh one. This is what turns a multi-part
+ *     model response into several separate WhatsApp-style bubbles instead
+ *     of one long message.
+ *  2. The "taking longer than expected" warning is now tracked by id and
+ *     automatically removed the moment real content starts arriving, so a
+ *     merely-slow-but-fine response doesn't leave a stale error sitting in
+ *     the chat next to a perfectly good answer.
+ *  3. Renders **bold** markers as actual <strong> text instead of literal
+ *     asterisks, since the model will still occasionally emphasize a word.
+ */
+
 "use client";
 
 import { socket } from "@/lib/socket";
@@ -11,6 +27,18 @@ interface ChatMessage {
 }
 
 const DEVICE_ID = "test-device-001";
+const ACK_TIMEOUT_MS = 5000;
+const THINKING_TIMEOUT_MS = 20000;
+
+function renderInlineMarkdown(text: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
 
 export default function SocketTestPage() {
   const [status, setStatus] = useState("Disconnected");
@@ -19,9 +47,10 @@ export default function SocketTestPage() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Queue to store incoming chunks for smooth typewriter rendering
-  const chunkQueueRef = useRef<string[]>([]);
-  const isTypingRef = useRef(false);
+  const hasConnectedBeforeRef = useRef(false);
+  const lastSyncAtRef = useRef<number>(Date.now());
+  const thinkingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stuckWarningIdRef = useRef<string | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -31,114 +60,177 @@ export default function SocketTestPage() {
     scrollToBottom();
   }, [messages, isSpeaking]);
 
-  // Process chunk queue character by character (or word by word)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (chunkQueueRef.current.length > 0) {
-        isTypingRef.current = true;
-        setIsSpeaking(true);
-
-        const nextChunk = chunkQueueRef.current.shift();
-        if (!nextChunk) return;
-
-        setMessages((prev) => {
-          const lastMsg = prev[prev.length - 1];
-
-          if (lastMsg && lastMsg.sender === "agent" && lastMsg.isStreaming) {
-            return [
-              ...prev.slice(0, -1),
-              { ...lastMsg, text: lastMsg.text + nextChunk },
-            ];
-          }
-
-          return [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              sender: "agent",
-              text: nextChunk,
-              isStreaming: true,
-            },
-          ];
-        });
-      } else if (isTypingRef.current && chunkQueueRef.current.length === 0) {
-        // Queue empty, finish active streaming bubble
-        isTypingRef.current = false;
-        setIsSpeaking(false);
-
-        setMessages((prev) => {
-          const lastMsg = prev[prev.length - 1];
-          if (lastMsg && lastMsg.sender === "agent" && lastMsg.isStreaming) {
-            return [
-              ...prev.slice(0, -1),
-              { ...lastMsg, isStreaming: false },
-            ];
-          }
-          return prev;
-        });
-      }
-    }, 20); // Adjust interval speed (ms) for faster/slower typing
-
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    if (!socket.connected) {
-      socket.connect();
+  const clearThinkingTimeout = () => {
+    if (thinkingTimeoutRef.current) {
+      clearTimeout(thinkingTimeoutRef.current);
+      thinkingTimeoutRef.current = null;
     }
+  };
 
+  const pushSystemMessage = (text: string) => {
+    const id = crypto.randomUUID();
+    setMessages((prev) => [...prev, { id, sender: "system", text }]);
+    return id;
+  };
+
+  // Called whenever real content arrives — retracts the stuck-thinking
+  // warning if one was showing, since it clearly wasn't actually stuck.
+  const dismissStuckWarningIfAny = () => {
+    if (stuckWarningIdRef.current) {
+      const idToRemove = stuckWarningIdRef.current;
+      stuckWarningIdRef.current = null;
+      setMessages((prev) => prev.filter((m) => m.id !== idToRemove));
+    }
+  };
+
+  const finalizeCurrentBubble = () => {
+    setMessages((prev) => {
+      const lastMsg = prev[prev.length - 1];
+      if (lastMsg && lastMsg.sender === "agent" && lastMsg.isStreaming) {
+        return [...prev.slice(0, -1), { ...lastMsg, isStreaming: false }];
+      }
+      return prev;
+    });
+  };
+
+  useEffect(() => {
     const onConnect = () => {
+      console.log("[Socket Client]: Connected", socket.id);
       setStatus("Connected");
       socket.emit("join:device", DEVICE_ID);
+
+      if (hasConnectedBeforeRef.current) {
+        socket.emit(
+          "agent:sync",
+          { deviceId: DEVICE_ID, since: lastSyncAtRef.current },
+          (data: { messages: any[] }) => {
+            const missed = data?.messages ?? [];
+            if (missed.length > 0) {
+              setMessages((prev) => [
+                ...prev,
+                ...missed.map((m: any) => ({
+                  id: String(m._id ?? crypto.randomUUID()),
+                  sender: "agent" as const,
+                  text: m.content ?? "",
+                })),
+              ]);
+              lastSyncAtRef.current = Date.now();
+            }
+          }
+        );
+      }
+      hasConnectedBeforeRef.current = true;
     };
 
-    const onDisconnect = () => {
+    const onDisconnect = (reason: string) => {
+      console.log("[Socket Client]: Disconnected", reason);
+      setStatus("Disconnected");
+      setIsSpeaking(false);
+      clearThinkingTimeout();
+    };
+
+    const onConnectError = (err: Error) => {
+      console.error("[Socket Client]: Connect error", err.message);
       setStatus("Disconnected");
     };
 
     const onThinking = () => {
       setIsSpeaking(true);
+      clearThinkingTimeout();
+      thinkingTimeoutRef.current = setTimeout(() => {
+        setIsSpeaking(false);
+        stuckWarningIdRef.current = pushSystemMessage(
+          "This is taking longer than expected — the connection may have dropped. Try sending again."
+        );
+      }, THINKING_TIMEOUT_MS);
     };
 
     const onResponseChunk = (data: { content: string }) => {
-      // Split large chunks into individual characters for smooth word-by-word streaming
-      const chars = data.content.split("");
-      chunkQueueRef.current.push(...chars);
+      clearThinkingTimeout();
+      dismissStuckWarningIfAny();
+      setMessages((prev) => {
+        const lastMsg = prev[prev.length - 1];
+        if (lastMsg && lastMsg.sender === "agent" && lastMsg.isStreaming) {
+          return [...prev.slice(0, -1), { ...lastMsg, text: lastMsg.text + data.content }];
+        }
+        return [
+          ...prev,
+          { id: crypto.randomUUID(), sender: "agent", text: data.content, isStreaming: true },
+        ];
+      });
+    };
+
+    // A single bubble is done — seal it. The next chunk (if any) starts a
+    // fresh bubble automatically, since it won't find a streaming message
+    // to append to.
+    const onPartComplete = () => {
+      finalizeCurrentBubble();
     };
 
     const onResponseComplete = () => {
-      // Wait for queue drain; completion handler inside setInterval closes the bubble
+      console.log("[Socket Client]: Response complete");
+      clearThinkingTimeout();
+      setIsSpeaking(false);
+      lastSyncAtRef.current = Date.now();
+      finalizeCurrentBubble();
     };
 
     const onError = (data: { message: string }) => {
+      console.error("[Socket Client]: Error", data);
+      clearThinkingTimeout();
       setIsSpeaking(false);
-      chunkQueueRef.current = [];
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          sender: "system",
-          text: `Error: ${data.message}`,
-        },
-      ]);
+      pushSystemMessage(`Error: ${data.message}`);
     };
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
+    socket.on("connect_error", onConnectError);
     socket.on("agent:thinking", onThinking);
     socket.on("agent:response:chunk", onResponseChunk);
+    socket.on("agent:response:part-complete", onPartComplete);
     socket.on("agent:response:complete", onResponseComplete);
     socket.on("agent:error", onError);
+
+    if (!socket.connected) {
+      console.log("[Socket Client]: Connecting...");
+      socket.connect();
+    }
 
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
+      socket.off("connect_error", onConnectError);
       socket.off("agent:thinking", onThinking);
       socket.off("agent:response:chunk", onResponseChunk);
+      socket.off("agent:response:part-complete", onPartComplete);
       socket.off("agent:response:complete", onResponseComplete);
       socket.off("agent:error", onError);
+      clearThinkingTimeout();
     };
   }, []);
+
+  const sendWithAck = (text: string) => {
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        pushSystemMessage("Message may not have been delivered — check your connection and try again.");
+      }
+    }, ACK_TIMEOUT_MS);
+
+    socket.emit(
+      "agent:message",
+      { deviceId: DEVICE_ID, message: text },
+      (ack: { received: boolean; error?: string }) => {
+        settled = true;
+        clearTimeout(timeout);
+        if (!ack?.received) {
+          pushSystemMessage(`Error: ${ack?.error ?? "delivery failed"}`);
+        }
+      }
+    );
+  };
 
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -147,15 +239,9 @@ export default function SocketTestPage() {
     const userText = inputMessage.trim();
     setInputMessage("");
 
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), sender: "user", text: userText },
-    ]);
+    setMessages((prev) => [...prev, { id: crypto.randomUUID(), sender: "user", text: userText }]);
 
-    socket.emit("agent:message", {
-      deviceId: DEVICE_ID,
-      message: userText,
-    });
+    sendWithAck(userText);
   };
 
   return (
@@ -222,7 +308,7 @@ export default function SocketTestPage() {
 
               <div className="max-w-[80%] rounded-2xl border border-neutral-800 bg-neutral-900 px-4 py-3 text-sm text-neutral-200 shadow-sm">
                 <div className="whitespace-pre-wrap leading-relaxed">
-                  {item.text}
+                  {renderInlineMarkdown(item.text)}
                   {item.isStreaming && (
                     <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-[#7657ff]" />
                   )}
